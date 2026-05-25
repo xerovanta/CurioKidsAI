@@ -55,40 +55,38 @@ Parents have a password-protected lock gate to review kid progression:
 
 ---
 
-## 🚀 Quick Start & Installation
+## 🚀 Deployment & Hosting
 
-### Prerequisites
-* **Node.js** (v18 or higher recommended)
-* **npm** or **yarn**
+CurioKids AI is fully configured for a unified deployment using **Firebase**. The backend functions, Firestore security rules, and Vite-compiled single-page client application can be deployed using the following guidelines:
 
-### Local Setup
-
-1. **Clone the repository:**
+### Firebase Setup & Deployment
+1. **Install Firebase CLI Tools globally:**
    ```bash
-   git clone https://github.com/xerovanta/CurioKidsAI.git
-   cd CurioKidsAI
+   npm install -g firebase-tools
    ```
-
-2. **Configure Environment Variables:**
-   Create a `.env` file inside the `frontend/` directory (you can copy `frontend/.env.example` as a starting point) and add your Firebase API credentials.
-   *(Note: The platform features a built-in sandbox sandbox fallback; if Firebase credentials are left blank, the app will run in **Offline/Mock Mode** so you can still fully explore the interface!).*
-
-3. **Install Client Dependencies:**
+2. **Log in to your Firebase account:**
+   ```bash
+   firebase login
+   ```
+3. **Choose and link your Firebase Project:**
+   ```bash
+   firebase use --add
+   ```
+4. **Compile the production bundles for your client application:**
    ```bash
    cd frontend
-   npm install
-   ```
-
-4. **Launch Vite Local Server:**
-   ```bash
-   npm run dev
-   ```
-   Open your browser and navigate to `http://localhost:3000` to start your adventure!
-
-5. **Build for Production:**
-   ```bash
    npm run build
+   cd ..
    ```
+5. **Deploy the complete stack (Hosting, Cloud Functions, and Firestore Rules):**
+   ```bash
+   firebase deploy
+   ```
+
+### Client-Only Deployment Options
+If you prefer to host only the client frontend separately:
+* **Vercel / Netlify**: Link your GitHub repository directly to Vercel or Netlify. Configure the build command as `npm run build` and output directory as `frontend/dist`.
+* **GitHub Pages**: Configure a GitHub Actions workflow to auto-build and deploy to GitHub Pages from the `main` branch.
 
 ---
 
