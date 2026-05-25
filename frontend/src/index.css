@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-curio-cream font-kids text-curio-slate select-none;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer utilities {
+  .bg-bubblegum-gradient {
+    @apply bg-gradient-to-r from-curio-pink via-curio-orange to-curio-yellow;
+  }
+  
+  .bg-ocean-gradient {
+    @apply bg-gradient-to-r from-curio-blue via-curio-purple to-curio-pink;
+  }
+
+  .bg-forest-gradient {
+    @apply bg-gradient-to-r from-curio-green to-curio-blue;
+  }
+
+  .text-glow-purple {
+    text-shadow: 0 0 8px rgba(99, 102, 241, 0.4);
+  }
+
+  .text-stroke-kids {
+    -webkit-text-stroke: 1.5px #1E293B;
+  }
+
+  /* Hide scrollbar for Chrome, Safari and Opera */
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Hide scrollbar for IE, Edge and Firefox */
+  .no-scrollbar {
+    -ms-overflow-style: none;  /* IE and Edge */
+    scrollbar-width: none;  /* Firefox */
+  }
+}
+
+/* Custom speech bubble tail style */
+.speech-bubble-tail::after {
+  content: '';
+  position: absolute;
+  bottom: -12px;
+  left: 24px;
+  width: 0;
+  height: 0;
+  border-left: 12px solid transparent;
+  border-right: 12px solid transparent;
+  border-top: 12px solid #FFFFFF;
+}
+
+/* Confetti styles */
+.confetti-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  z-index: 999;
+}

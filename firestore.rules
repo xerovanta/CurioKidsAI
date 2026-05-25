@@ -1,0 +1,38 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper: Check if the request is from the account owner
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    
+    // Helper: Check if the request is from a parent linked to this child profile
+    function isLinkedParent(childUid) {
+      return request.auth != null && 
+        exists(/databases/$(database)/documents/parents/$(request.auth.uid)) &&
+        childUid in get(/databases/$(database)/documents/parents/$(request.auth.uid)).data.children;
+    }
+
+    // Children Profile Rules
+    match /children/{childUid} {
+      allow read, write: if isOwner(childUid) || isLinkedParent(childUid);
+      
+      // Telemetry Logs sub-collections
+      match /logs/{logId} {
+        allow read, write: if isOwner(childUid) || isLinkedParent(childUid);
+      }
+    }
+
+    // Interaction Logs Rules (Direct collection query path)
+    match /interactions/{childUid}/logs/{logId} {
+      allow read, write: if isOwner(childUid) || isLinkedParent(childUid);
+    }
+
+    // Parent Accounts Rules
+    match /parents/{parentUid} {
+      allow read, write: if isOwner(parentUid);
+    }
+  }
+}

@@ -1,0 +1,56 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_modules/
+backend/functions/node_modules/
+
+# Production build outputs
+dist/
+build/
+out/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# Python caching & virtual environment directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs & Editor configurations
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Firebase config & logs
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
