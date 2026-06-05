@@ -7,13 +7,30 @@ import { useHandTracking } from '../hooks/useHandTracking';
 import AIBuddy from '../components/AIBuddy';
 import { collection, addDoc } from 'firebase/firestore';
 import { db, isValidConfig } from '../firebase';
-import { alphabetQuestions } from '../utils/alphabetQuestions';
+import { getLevelConfig, getNextLevelStars } from '../utils/levelSystem.js';
+import { calculateStars } from '../utils/scoringEngine.js';
+import GameHeader from '../components/game/GameHeader.jsx';
+import GameComplete from '../components/game/GameComplete.jsx';
+import LevelSelect from '../components/game/LevelSelect.jsx';
+
+import { useSound } from '../hooks/useSound.js';
 
 export default function AlphabetGrab({ onBack }) {
   const { currentUser, childProfile, awardStars, incrementMission, incrementStat, earnBadge } = useAuth();
+  const { playClick, playCorrect, playWrong, playWin } = useSound();
 
+  // Level & Phase states
+  const [currentLevel, setCurrentLevel] = useState(1);
+  const [gamePhase, setGamePhase] = useState('menu'); // 'menu' | 'playing' | 'complete'
+  const [sessionQuestions, setSessionQuestions] = useState([]);
   const [questionIndex, setQuestionIndex] = useState(0);
-  const currentQuestion = alphabetQuestions[questionIndex % alphabetQuestions.length];
+
+  const currentQuestion = sessionQuestions[questionIndex] || {
+    prompt: 'What comes after A?',
+    answer: 'B',
+    options: ['B', 'C', 'D'],
+    type: 'after'
+  };
 
   // Mode settings
   const [sandboxMode, setSandboxMode] = useState(false);
@@ -25,27 +42,65 @@ export default function AlphabetGrab({ onBack }) {
   const [score, setScore] = useState(0);
   const [streak, setStreak] = useState(0);
   const [bestStreak, setBestStreak] = useState(0);
-  const [sessionCompleted, setSessionCompleted] = useState(false);
   const [loadingLetters, setLoadingLetters] = useState(true);
 
   // Floating balloons state
   const [balloons, setBalloons] = useState([]);
   const [grabbedId, setGrabbedId] = useState(null);
   
-  // Custom interactive animations
+  // Custom interactive animations & feedback
   const [particles, setParticles] = useState([]);
   const [wrongShakeId, setWrongShakeId] = useState(null);
+  const [flashRed, setFlashRed] = useState(false);
+  const [shakeScreen, setShakeScreen] = useState(false);
+
+  // Timing
+  const [timeTaken, setTimeTaken] = useState(0);
+
+  // Stats states
+  const [stats, setStats] = useState({
+    questionsAttempted: 0,
+    questionsCorrect: 0
+  });
+
+  // Stars tracking
+  const [earnedStars, setEarnedStars] = useState(0);
+  const [calculatedPoints, setCalculatedPoints] = useState(0);
+  const [gameStars, setGameStars] = useState({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
 
   // HTML5 Canvases & loop refs
   const gameCanvasRef = useRef(null);
   const sparklesCanvasRef = useRef(null);
-  const isGrabbingPrevRef = useRef(false);
+  const isPinchingPrevRef = useRef(false);
   
   const balloonsRef = useRef([]);
   const grabbedIdRef = useRef(null);
   const sandboxModeRef = useRef(sandboxMode);
   const grabPositionRef = useRef({ x: 0, y: 0 });
   const frameCounterRef = useRef(0);
+
+  const config = getLevelConfig('alphabetGrab', currentLevel) || {};
+
+  // World Themes list mapping to levels
+  const themes = {
+    1: { name: 'Jungle Green', style: 'from-emerald-950 via-teal-950 to-emerald-900', border: 'border-emerald-500' },
+    2: { name: 'Ocean Blue', style: 'from-sky-950 via-blue-950 to-sky-900', border: 'border-sky-500' },
+    3: { name: 'Space Dark', style: 'from-indigo-950 via-slate-950 to-black', border: 'border-indigo-500' },
+    4: { name: 'Sunset Red', style: 'from-rose-950 via-orange-950 to-stone-950', border: 'border-rose-500' },
+    5: { name: 'Cosmic Candy', style: 'from-purple-950 via-fuchsia-950 to-slate-950', border: 'border-fuchsia-500' }
+  };
+  const activeTheme = themes[currentLevel] || themes[1];
+
+  // Load level stars from localStorage on child profile load
+  useEffect(() => {
+    if (childProfile) {
+      const storageKey = `curiokids_stars_alphabetGrab_${childProfile.uid || 'guest'}`;
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        setGameStars(JSON.parse(saved));
+      }
+    }
+  }, [childProfile]);
 
   // Keep refs synchronized to bypass closure locks in requestAnimationFrame
   useEffect(() => {
@@ -59,24 +114,40 @@ export default function AlphabetGrab({ onBack }) {
   // Initialize hand tracking hook
   const {
     indexFingerTip,
+    isPinching, // Using high-accuracy, debounced, stable pinching filter
     isGrabbing,
     grabPosition,
     isHandDetected,
     isLoadingModels,
     videoRef,
     canvasRef: skeletonCanvasRef,
-    stopTracking
-  } = useHandTracking({ active: !sandboxMode });
+    stopTracking,
+    handScale,
+    isHandConfident
+  } = useHandTracking({ active: !sandboxMode && gamePhase === 'playing' });
 
   // Update cursor position ref
   useEffect(() => {
-    if (grabPosition) {
-      grabPositionRef.current = grabPosition;
+    if (indexFingerTip) {
+      grabPositionRef.current = indexFingerTip;
     }
-  }, [grabPosition]);
+  }, [indexFingerTip]);
+
+  // Live Timer Effect for Target Mode
+  useEffect(() => {
+    if (gamePhase !== 'playing') return;
+
+    const startTime = Date.now();
+    const interval = setInterval(() => {
+      setTimeTaken(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [gamePhase]);
 
   // Sparkle generator triggers
   const spawnSparkles = (cx, cy) => {
+    playClick(); // Play grab/click sound effect
     const freshParticles = [];
     for (let i = 0; i < 15; i++) {
       const angle = Math.random() * 2 * Math.PI;
@@ -132,9 +203,9 @@ export default function AlphabetGrab({ onBack }) {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // 1. Initialize Question state & read question aloud via speech synthesis
+  // Initialize Question state
   useEffect(() => {
-    if (!currentQuestion) return;
+    if (sessionQuestions.length === 0 || gamePhase !== 'playing') return;
 
     setLoadingLetters(true);
     setAttempts(0);
@@ -142,7 +213,7 @@ export default function AlphabetGrab({ onBack }) {
     setGrabbedId(null);
     grabbedIdRef.current = null;
     
-    const introPrompt = `${currentQuestion.prompt} Pinch the balloon to grab it, then drop it in the mouth!`;
+    const introPrompt = `${currentQuestion.prompt} Pinch the balloon to grab, and drop it in the monster mouth!`;
     setBuddyText(introPrompt);
     setBuddyState('idle');
 
@@ -151,25 +222,24 @@ export default function AlphabetGrab({ onBack }) {
       if (window.speechSynthesis) {
         window.speechSynthesis.cancel(); // clear queue
         const utterance = new SpeechSynthesisUtterance(currentQuestion.prompt);
-        utterance.pitch = 1.3;
-        utterance.rate = 0.95;
+        utterance.pitch = 1.35;
+        utterance.rate = 1.0;
         window.speechSynthesis.speak(utterance);
       }
     } catch (e) {
       console.warn("Speech synthesis failed to execute:", e);
     }
 
-    // Initialize letters focused towards screen center initially (640x480 bounds)
-    const options = currentQuestion.options;
+    // Distribute balloons based on options
+    const options = currentQuestion.options || [];
     
-    console.log(`Rendering ${options.length} letters on canvas`);
-
     const initialBalloons = options.map((label, idx) => {
       const totalWidth = (options.length - 1) * 90;
       const startX = 320 - (totalWidth / 2) + idx * 90;
-      const startY = 200 + (idx % 2 === 0 ? -20 : 20); // staggered vertical spacing
+      const startY = 180 + (idx % 2 === 0 ? -20 : 20); // staggered vertical spacing
       
-      const speedScale = currentQuestion.difficulty === 1 ? 0.7 : (currentQuestion.difficulty === 2 ? 1.3 : 1.9);
+      const speed = config.speed || 'slow';
+      const speedScale = speed === 'slow' ? 0.6 : (speed === 'medium' ? 1.2 : (speed === 'fast' ? 1.8 : 2.4));
 
       return {
         id: idx,
@@ -190,16 +260,17 @@ export default function AlphabetGrab({ onBack }) {
         ][idx % 6],
         radius: 38,
         shaking: false,
-        shakeOffset: 0
+        shakeOffset: 0,
+        returning: false
       };
     });
 
     balloonsRef.current = initialBalloons;
     setBalloons(initialBalloons);
     setLoadingLetters(false);
-  }, [questionIndex, currentQuestion]);
+  }, [questionIndex, sessionQuestions, gamePhase]);
 
-  // 2. Continuous physics simulation update loop (60fps)
+  // Continuous physics simulation update loop (60fps)
   useEffect(() => {
     let animId;
     
@@ -208,13 +279,42 @@ export default function AlphabetGrab({ onBack }) {
       const cursor = sandboxModeRef.current ? { x: 0, y: 0 } : grabPositionRef.current;
 
       balloonsRef.current.forEach(b => {
-        if (b.id === grabbedCurId) {
-          // Locked to cursor
+        if (b.swallowed) {
+          // Smoothly animate towards monster mouth center (x: 320, y: 400) and shrink to 0
+          b.x += (320 - b.x) * 0.15;
+          b.y += (400 - b.y) * 0.15;
+          b.radius = Math.max(0, b.radius - 2.5);
+        } else if (b.id === grabbedCurId) {
+          // Locked to cursor with silky-smooth spring damping physics + vertical offset so hand doesn't block letter
           if (!sandboxModeRef.current) {
+            const targetX = cursor.x;
+            const targetY = cursor.y - 20; // 20px offset
+            const ax = (targetX - b.x) * 0.09; // spring stiffness
+            const ay = (targetY - b.y) * 0.09;
+            
+            b.vx = (b.vx + ax) * 0.70; // spring friction
+            b.vy = (b.vy + ay) * 0.70;
+            
+            b.x += b.vx;
+            b.y += b.vy;
+          } else {
             b.x = cursor.x;
             b.y = cursor.y;
           }
           b.radius = 46;
+        } else if (b.returning) {
+          // Smooth spring back return to spawn coordinates
+          b.x += (b.startX - b.x) * 0.12;
+          b.y += (b.startY - b.y) * 0.12;
+          b.radius = 38;
+
+          const dx = b.x - b.startX;
+          const dy = b.y - b.startY;
+          if (Math.sqrt(dx * dx + dy * dy) < 4) {
+            b.returning = false;
+            b.vx = (Math.random() - 0.5) * 1.2;
+            b.vy = (Math.random() - 0.5) * 1.2 - 0.2;
+          }
         } else {
           // Standard bobbing drift
           b.x += b.vx;
@@ -245,117 +345,61 @@ export default function AlphabetGrab({ onBack }) {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // 3. SECURE CANVAS DRAWING EFFECT (Triggered after React DOM commit)
+  // SECURE CANVAS DRAWING EFFECT (Triggered after React DOM commit)
   useEffect(() => {
     const canvas = gameCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     
+    // Completely clear canvas balloons duplicate drawings!
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    frameCounterRef.current++;
-    if (frameCounterRef.current % 120 === 0) {
-      console.log(`⏱️ Drawing loop running: frame #${frameCounterRef.current}`);
-    }
-
-    if (balloons.length === 0) return;
-
-    balloons.forEach(b => {
-      if (typeof b.x !== 'number' || typeof b.y !== 'number') return;
-
-      ctx.save();
-
-      // Outer contrasting glow circle
-      ctx.shadowBlur = b.id === grabbedId ? 22 : 10;
-      ctx.shadowColor = b.id === grabbedId ? '#FF9F1C' : 'rgba(0, 0, 0, 0.25)';
-
-      if (b.label === currentQuestion.answer) {
-        ctx.shadowBlur = 18;
-        ctx.shadowColor = '#FF4FA3';
-      }
-
-      // Draw custom balloon body
-      const grad = ctx.createRadialGradient(b.x - 10, b.y - 10, 5, b.x, b.y, b.radius);
-      grad.addColorStop(0, '#FFFFFF');
-      grad.addColorStop(0.3, b.color);
-      grad.addColorStop(1, b.color);
-
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(b.x, b.y, b.radius, 0, 2 * Math.PI);
-      ctx.fill();
-
-      // Knot at bottom
-      ctx.fillStyle = b.color;
-      ctx.beginPath();
-      ctx.moveTo(b.x, b.y + b.radius - 2);
-      ctx.lineTo(b.x - 6, b.y + b.radius + 6);
-      ctx.lineTo(b.x + 6, b.y + b.radius + 6);
-      ctx.closePath();
-      ctx.fill();
-
-      // Wobbly string
-      ctx.strokeStyle = 'rgba(30, 41, 59, 0.25)';
-      ctx.lineWidth = 2.5;
-      ctx.beginPath();
-      ctx.moveTo(b.x, b.y + b.radius + 6);
-      ctx.bezierCurveTo(
-        b.x - 5, b.y + b.radius + 16,
-        b.x + 5, b.y + b.radius + 26,
-        b.x, b.y + b.radius + 36
-      );
-      ctx.stroke();
-
-      // Render bold typography (MINIMUM 48PX outline for legibility)
-      ctx.fillStyle = '#FFFFFF';
-      ctx.font = 'black 48px "Fredoka", "Lexend", sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.shadowBlur = 0; 
-
-      ctx.strokeStyle = '#1E293B'; 
-      ctx.lineWidth = 6;
-      ctx.strokeText(b.label, b.x, b.y);
-      ctx.fillText(b.label, b.x, b.y);
-
-      ctx.restore();
-    });
   }, [balloons, grabbedId, currentQuestion]);
 
   // Grabbing Pinch Event listeners from camera hook
   useEffect(() => {
-    if (sandboxMode || !isHandDetected || isLoadingModels || !matchingActive) return;
+    if (sandboxMode || !isHandDetected || isLoadingModels || !matchingActive || gamePhase !== 'playing') return;
 
-    if (isGrabbing) {
-      if (!isGrabbingPrevRef.current && grabbedId === null) {
+    if (isPinching) {
+      if (!isPinchingPrevRef.current && grabbedId === null) {
         balloonsRef.current.forEach(b => {
-          const d = Math.sqrt(Math.pow(grabPosition.x - b.x, 2) + Math.pow(grabPosition.y - b.y, 2));
-          if (d < 58) {
+          // Increased child-friendly hit hitbox to 65px
+          const d = Math.sqrt(Math.pow(indexFingerTip.x - b.x, 2) + Math.pow(indexFingerTip.y - b.y, 2));
+          if (d < 65 && !b.swallowed && !b.returning) {
             setGrabbedId(b.id);
+            grabbedIdRef.current = b.id;
             spawnSparkles(b.x, b.y);
           }
         });
       }
     } else {
-      if (isGrabbingPrevRef.current && grabbedId !== null) {
+      if (isPinchingPrevRef.current && grabbedId !== null) {
         handleLetterRelease(grabbedId);
       }
     }
 
-    isGrabbingPrevRef.current = isGrabbing;
-  }, [isGrabbing, grabPosition, isHandDetected, isLoadingModels, grabbedId, sandboxMode, matchingActive]);
+    isPinchingPrevRef.current = isPinching;
+  }, [isPinching, indexFingerTip, isHandDetected, isLoadingModels, grabbedId, sandboxMode, matchingActive, gamePhase]);
 
   const handleLetterRelease = (balloonId) => {
     const droppedBalloon = balloonsRef.current.find(b => b.id === balloonId);
     if (!droppedBalloon) return;
 
-    const isOverDropZone = droppedBalloon.y > 330 && droppedBalloon.x > 200 && droppedBalloon.x < 440;
+    // Generous drop zone over monster mouth
+    const isOverDropZone = droppedBalloon.y > 300 && droppedBalloon.x > 180 && droppedBalloon.x < 460;
 
     if (isOverDropZone) {
       setGrabbedId(null);
       grabbedIdRef.current = null;
       verifyAnswer(droppedBalloon);
     } else {
+      // Released outside: Trigger spring-back return animation
+      balloonsRef.current = balloonsRef.current.map(b => {
+        if (b.id === balloonId) {
+          return { ...b, returning: true };
+        }
+        return b;
+      });
+      setBalloons([...balloonsRef.current]);
       setGrabbedId(null);
       grabbedIdRef.current = null;
       setBuddyState('idle');
@@ -363,6 +407,15 @@ export default function AlphabetGrab({ onBack }) {
   };
 
   const verifyAnswer = async (balloon) => {
+    // Set swallowed to true immediately!
+    balloonsRef.current = balloonsRef.current.map(b => {
+      if (b.id === balloon.id) {
+        return { ...b, swallowed: true };
+      }
+      return b;
+    });
+    setBalloons([...balloonsRef.current]);
+
     const nextAttempts = attempts + 1;
     setAttempts(nextAttempts);
 
@@ -371,11 +424,16 @@ export default function AlphabetGrab({ onBack }) {
     if (isCorrect) {
       setMatchingActive(false);
       setBuddyState('happy');
-      setBuddyText(`Perfect! That is the letter ${balloon.label}! Splendid job! ⭐️`);
+      setBuddyText(`Perfect! You grabbed the letter ${balloon.label}! ⭐️`);
 
+      // Spawn extra pop sparkles at monster mouth
+      spawnSparkles(320, 400);
+      playCorrect(); // play correct chime sound
+
+      // Trigger Confetti Drop
       confetti({
-        particleCount: 110,
-        spread: 80,
+        particleCount: 80,
+        spread: 50,
         origin: { y: 0.6 }
       });
 
@@ -394,69 +452,292 @@ export default function AlphabetGrab({ onBack }) {
       setStreak(nextStreak);
       if (nextStreak > bestStreak) setBestStreak(nextStreak);
 
-      await incrementStat('alphabetGrabLetters', 1);
-      await incrementMission(1); // complete daily mission
+      setStats(prev => ({
+        questionsAttempted: prev.questionsAttempted + 1,
+        questionsCorrect: prev.questionsCorrect + 1
+      }));
 
-      // Milestones check
+      await incrementStat('alphabetGrabLetters', 1);
+      await incrementMission(1);
+
+      // Achievements
       const nextQIndex = questionIndex + 1;
       if (nextQIndex === 5) {
-        setBuddyText("🎉 Woohoo! 5 questions completed! Let's do a mini victory dance!");
+        setBuddyText("🎉 Awesome! 5 correct sequence gaps matched!");
       }
       if (nextQIndex === 10) {
         await earnBadge('letter-champion');
-        setBuddyText("🎖️ Letter Champion unlocked! You earned the Letter Champion Badge!");
       }
 
       await logTelemetry(true, balloon.label);
 
       setTimeout(() => {
         advanceQuestion();
-      }, 4000);
+      }, 3000);
 
     } else {
       setBuddyState('sad');
+      setFlashRed(true);
+      setShakeScreen(true); // screen shake on wrong drop!
+      playWrong(); // Play incorrect sound
       
+      setTimeout(() => {
+        setFlashRed(false);
+        setShakeScreen(false);
+      }, 500);
+      
+      setStats(prev => ({
+        ...prev,
+        questionsAttempted: prev.questionsAttempted + 1
+      }));
+
       if (nextAttempts >= 3) {
         setMatchingActive(false);
-        setBuddyText(`Good effort! The correct answer is indeed ${currentQuestion.answer}. Let's try the next one! 🎈`);
+        setBuddyText(`Good effort! The sequence completed with: ${currentQuestion.answer}. 🎈`);
         await logTelemetry(false, balloon.label);
         setStreak(0);
         
         setTimeout(() => {
           advanceQuestion();
-        }, 4000);
+        }, 3200);
       } else {
-        setBuddyText(`Oops! That's not correct. Attempt ${nextAttempts}/3. Try grabbing another balloon! 💪`);
+        setBuddyText(`Not quite! Attempt ${nextAttempts}/3. Look closely and grab again! 💪`);
         setStreak(0);
         await logTelemetry(false, balloon.label);
 
-        setWrongShakeId(balloon.id);
+        // Respawn the incorrect balloon back in the sky area after it is swallowed completely (1.5s)
         setTimeout(() => {
-          setWrongShakeId(null);
           balloonsRef.current = balloonsRef.current.map(b => {
             if (b.id === balloon.id) {
               return {
                 ...b,
+                swallowed: false,
                 x: 200 + Math.random() * 240,
-                y: 160 + Math.random() * 100
+                y: 120 + Math.random() * 100,
+                radius: 38,
+                vx: (Math.random() - 0.5) * 1.5,
+                vy: (Math.random() - 0.5) * 1.5 - 0.2
               };
             }
             return b;
           });
           setBalloons([...balloonsRef.current]);
-        }, 1200);
+        }, 1500);
       }
     }
   };
 
   const advanceQuestion = () => {
-    if (questionIndex < 9) {
-      setQuestionIndex(prev => prev + 1);
+    const nextIdx = questionIndex + 1;
+    if (nextIdx < 10) {
+      setQuestionIndex(nextIdx);
     } else {
-      setSessionCompleted(true);
-      setBuddyState('happy');
-      setBuddyText("Hooray! You completed all 10 alphabet sequence cards! What a spelling hero! 👑");
+      handleSessionComplete();
     }
+  };
+
+  const handleSessionComplete = async () => {
+    setBuddyState('happy');
+    setBuddyText("Hooray! Sequence completed! Let's check your stars! 🏆");
+
+    const attempted = stats.questionsAttempted;
+    const accuracyVal = attempted > 0 ? Math.round((stats.questionsCorrect / attempted) * 100) : 100;
+
+    // Calculate stars
+    const { stars, points } = calculateStars('alphabetGrab', currentLevel, {
+      accuracy: accuracyVal,
+      timeTaken,
+      streak: bestStreak,
+      firstTry: (gameStars[currentLevel] || 0) === 0
+    });
+
+    setEarnedStars(stars);
+    setCalculatedPoints(points);
+
+    // Save level stars locally
+    const storageKey = `curiokids_stars_alphabetGrab_${childProfile?.uid || 'guest'}`;
+    const updatedStars = { ...gameStars, [currentLevel]: Math.max(gameStars[currentLevel] || 0, stars) };
+    setGameStars(updatedStars);
+    localStorage.setItem(storageKey, JSON.stringify(updatedStars));
+
+    // Award overall stars to profile
+    const previousStars = gameStars[currentLevel] || 0;
+    const newStarsGained = Math.max(0, stars - previousStars);
+    if (newStarsGained > 0) {
+      await awardStars(newStarsGained, 'alphabet-grab');
+    }
+
+    // Standard achievements tracking
+    await incrementStat('alphabetGrabLetters', stats.questionsCorrect);
+    await incrementMission(1);
+
+    // Write session log
+    const uid = currentUser?.uid || 'guest';
+    const sessionData = {
+      gameType: 'alphabetGrab',
+      level: currentLevel,
+      starsEarned: stars,
+      pointsEarned: points,
+      accuracy: accuracyVal,
+      timeTaken: timeTaken,
+      questionsCorrect: stats.questionsCorrect,
+      timestamp: new Date().toISOString()
+    };
+
+    if (isValidConfig && db && currentUser) {
+      try {
+        await addDoc(collection(db, 'children', uid, 'sessions'), sessionData);
+      } catch (err) {
+        console.error("Firestore session logging failed:", err);
+      }
+    } else {
+      const sessionKey = `curiokids_sessions_${uid}`;
+      const existing = localStorage.getItem(sessionKey);
+      const sessions = existing ? JSON.parse(existing) : [];
+      sessions.push(sessionData);
+      localStorage.setItem(sessionKey, JSON.stringify(sessions));
+    }
+
+    setGamePhase('complete');
+  };
+
+  const handleNextLevel = () => {
+    const nextLevel = currentLevel + 1;
+    if (nextLevel <= 5) {
+      setCurrentLevel(nextLevel);
+      setGamePhase('playing');
+      startNewGame(nextLevel);
+    } else {
+      setGamePhase('menu');
+    }
+  };
+
+  const generateQuestions = (levelNum) => {
+    const lvlConfig = getLevelConfig('alphabetGrab', levelNum);
+    if (!lvlConfig) return [];
+    
+    const types = lvlConfig.questionTypes || ['after'];
+    const numOptions = lvlConfig.numOptions || 3;
+    
+    const questions = [];
+    
+    for (let i = 0; i < 10; i++) {
+      const type = types.includes('all')
+        ? ['after', 'before', 'missing', 'spell'][Math.floor(Math.random() * 4)]
+        : types[Math.floor(Math.random() * types.length)];
+        
+      if (type === 'after') {
+        const charCode = 65 + Math.floor(Math.random() * 23); // A-X
+        const current = String.fromCharCode(charCode);
+        const next = String.fromCharCode(charCode + 1);
+        
+        const opts = new Set([next]);
+        while (opts.size < numOptions) {
+          const randChar = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+          opts.add(randChar);
+        }
+        
+        questions.push({
+          prompt: `What comes after ${current}?`,
+          answer: next,
+          options: [...opts].sort(() => Math.random() - 0.5),
+          type: 'after',
+          difficulty: levelNum <= 2 ? 1 : (levelNum === 3 ? 2 : 3)
+        });
+      }
+      else if (type === 'before') {
+        const charCode = 66 + Math.floor(Math.random() * 24); // B-Y
+        const current = String.fromCharCode(charCode);
+        const prev = String.fromCharCode(charCode - 1);
+        
+        const opts = new Set([prev]);
+        while (opts.size < numOptions) {
+          const randChar = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+          opts.add(randChar);
+        }
+        
+        questions.push({
+          prompt: `What comes before ${current}?`,
+          answer: prev,
+          options: [...opts].sort(() => Math.random() - 0.5),
+          type: 'before',
+          difficulty: levelNum <= 2 ? 1 : (levelNum === 3 ? 2 : 3)
+        });
+      }
+      else if (type === 'missing') {
+        const charCode = 65 + Math.floor(Math.random() * 22); // A-W
+        const first = String.fromCharCode(charCode);
+        const mid = String.fromCharCode(charCode + 1);
+        const last = String.fromCharCode(charCode + 2);
+        
+        const opts = new Set([mid]);
+        while (opts.size < numOptions) {
+          const randChar = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+          opts.add(randChar);
+        }
+        
+        questions.push({
+          prompt: `Fill in the blank: ${first} _ ${last}`,
+          answer: mid,
+          options: [...opts].sort(() => Math.random() - 0.5),
+          type: 'missing',
+          difficulty: levelNum <= 2 ? 1 : (levelNum === 3 ? 2 : 3)
+        });
+      }
+      else if (type === 'spell') {
+        const spellPool = [
+          { word: 'CAT', missing: 'A', display: 'C _ T 🐱' },
+          { word: 'DOG', missing: 'O', display: 'D _ G 🐶' },
+          { word: 'LION', missing: 'I', display: 'L _ O N 🦁' },
+          { word: 'BEE', missing: 'E', display: 'B _ E 🐝' },
+          { word: 'FROG', missing: 'R', display: 'F _ O G 🐸' },
+          { word: 'DUCK', missing: 'U', display: 'D _ C K 🦆' },
+          { word: 'PEAR', missing: 'E', display: 'P _ A R 🍐' },
+          { word: 'STAR', missing: 'A', display: 'S T _ R ⭐️' },
+          { word: 'SUN', missing: 'U', display: 'S _ N ☀️' }
+        ];
+        
+        const selected = spellPool[Math.floor(Math.random() * spellPool.length)];
+        
+        const opts = new Set([selected.missing]);
+        while (opts.size < numOptions) {
+          const randChar = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+          opts.add(randChar);
+        }
+        
+        questions.push({
+          prompt: `Find the spelling letter for: ${selected.display}`,
+          answer: selected.missing,
+          options: [...opts].sort(() => Math.random() - 0.5),
+          type: 'spell',
+          difficulty: levelNum <= 2 ? 1 : (levelNum === 3 ? 2 : 3)
+        });
+      }
+    }
+    
+    return questions;
+  };
+
+  const startNewGame = (levelNum = currentLevel) => {
+    const activeLevel = levelNum || currentLevel;
+    const generated = generateQuestions(activeLevel);
+
+    setSessionQuestions(generated);
+    setQuestionIndex(0);
+    setScore(0);
+    setStreak(0);
+    setBestStreak(0);
+    setAttempts(0);
+    setGrabbedId(null);
+    grabbedIdRef.current = null;
+    setMatchingActive(true);
+    setTimeTaken(0);
+    setStats({
+      questionsAttempted: 0,
+      questionsCorrect: 0
+    });
+
+    setGamePhase('playing');
   };
 
   const logTelemetry = async (success, labelSeen) => {
@@ -467,7 +748,7 @@ export default function AlphabetGrab({ onBack }) {
       target: currentQuestion.answer,
       detected: labelSeen,
       emotion: success ? 'happy' : 'sad',
-      difficulty: currentQuestion.difficulty === 1 ? 'EASY' : (currentQuestion.difficulty === 2 ? 'MEDIUM' : 'HARD')
+      difficulty: currentLevel <= 2 ? 'EASY' : (currentLevel === 3 ? 'MEDIUM' : 'HARD')
     };
 
     if (isValidConfig && db && currentUser) {
@@ -481,7 +762,7 @@ export default function AlphabetGrab({ onBack }) {
     }
   };
 
-  // Sandbox Click & Drag controllers
+  // Sandbox drag coordinates
   const getCanvasOffsetCoords = (e) => {
     const canvas = gameCanvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
@@ -496,12 +777,12 @@ export default function AlphabetGrab({ onBack }) {
   };
 
   const handleSandboxStart = (e) => {
-    if (!sandboxMode || !matchingActive) return;
+    if (!sandboxMode || !matchingActive || gamePhase !== 'playing') return;
     const coords = getCanvasOffsetCoords(e);
     
     balloonsRef.current.forEach(b => {
       const d = Math.sqrt(Math.pow(coords.x - b.x, 2) + Math.pow(coords.y - b.y, 2));
-      if (d < b.radius + 10) {
+      if (d < b.radius + 15) {
         setGrabbedId(b.id);
         grabbedIdRef.current = b.id;
         spawnSparkles(b.x, b.y);
@@ -510,7 +791,7 @@ export default function AlphabetGrab({ onBack }) {
   };
 
   const handleSandboxMove = (e) => {
-    if (!sandboxMode || grabbedId === null || !matchingActive) return;
+    if (!sandboxMode || grabbedId === null || !matchingActive || gamePhase !== 'playing') return;
     const coords = getCanvasOffsetCoords(e);
     
     balloonsRef.current = balloonsRef.current.map(b => {
@@ -523,275 +804,311 @@ export default function AlphabetGrab({ onBack }) {
   };
 
   const handleSandboxEnd = () => {
-    if (!sandboxMode || grabbedId === null || !matchingActive) return;
+    if (!sandboxMode || grabbedId === null || !matchingActive || gamePhase !== 'playing') return;
     handleLetterRelease(grabbedId);
   };
 
-  const resetSession = () => {
-    setQuestionIndex(0);
-    setScore(0);
-    setStreak(0);
-    setSessionCompleted(false);
-    setMatchingActive(true);
-    setGrabbedId(null);
-    grabbedIdRef.current = null;
-  };
+  const isHoveringDropZone = balloons.some(b => b.id === grabbedId && b.y > 280 && b.x > 180 && b.x < 460);
 
   return (
     <div className="space-y-6">
-      
-      {/* Game Header */}
-      <div className="flex justify-between items-center bg-white/70 backdrop-blur-md p-4 rounded-3xl border-3 border-white/60 shadow-lg">
-        <div className="flex items-center gap-2">
-          <span className="text-3xl">🎈🗣️</span>
-          <div>
-            <h3 className="text-base font-black text-curio-slate">Alphabet Grab Room</h3>
-            <p className="text-[10px] font-bold text-slate-400">Grab floating balloons and drop them to answer!</p>
-          </div>
-        </div>
+      {gamePhase === 'menu' && (
+        <LevelSelect
+          gameType="alphabetGrab"
+          currentLevel={currentLevel}
+          onSelectLevel={(levelNum) => {
+            setCurrentLevel(levelNum);
+            startNewGame(levelNum);
+          }}
+          gameStars={gameStars}
+        />
+      )}
 
-        <div className="flex items-center gap-3">
-          <div className="bg-curio-yellow text-curio-slate-dark px-3.5 py-1 rounded-full text-xs font-black border-2 border-curio-slate flex items-center gap-1 shadow">
-            <Star className="w-3.5 h-3.5 fill-curio-yellow text-curio-yellow-dark" />
-            <span>Stars: {score}</span>
-          </div>
+      {gamePhase === 'playing' && (
+        <>
+          <GameHeader
+            gameName="alphabetGrab"
+            level={currentLevel}
+            levelName={config.name}
+            stars={gameStars[currentLevel] || 0}
+            totalStars={Object.values(gameStars).reduce((s, a) => s + a, 0)}
+            onPause={() => setBuddyText("Take a breath! Find those letters whenever you are ready! 🧘🎈")}
+            onQuit={onBack}
+          />
 
-          <button 
-            onClick={onBack}
-            className="bg-slate-100 hover:bg-slate-200 border-2 border-curio-slate text-curio-slate font-black px-3.5 py-1.5 rounded-2xl text-xs uppercase cursor-pointer transition transform active:scale-95 shadow"
-          >
-            ◀ Lobby
-          </button>
-        </div>
-      </div>
+          <AIBuddy
+            skin={childProfile?.companion || 'sparky'}
+            state={buddyState}
+            text={buddyText}
+          />
 
-      <AIBuddy 
-        skin={childProfile?.companion || 'sparky'} 
-        state={buddyState} 
-        text={buddyText} 
-      />
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* Left Screen: Floating Canvas */}
-        <div className="lg:col-span-2 bg-white/70 backdrop-blur-md p-4 rounded-4xl border-3 border-white/60 shadow-lg flex flex-col items-center relative min-h-[350px]">
-          
-          {sessionCompleted ? (
-            /* Complete victory panel */
-            <motion.div
-              key="victory-screen"
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              className="flex flex-col items-center justify-center py-12 text-center space-y-6 w-full select-none"
-            >
-              <div className="text-7xl block animate-bounce-slow">👑🎈🎉</div>
-              <h4 className="font-black text-2xl text-curio-slate uppercase tracking-wider">Spelling Champion!</h4>
-              <p className="text-slate-500 font-bold max-w-xs mx-auto text-sm">
-                Outstanding! You answered all 10 alphabet sequence cards correctly! Your best streak was **{bestStreak}**!
-              </p>
-
-              <div className="flex gap-4">
-                <button
-                  onClick={resetSession}
-                  className="bg-curio-green hover:bg-curio-green-dark text-white font-black py-3 px-6 rounded-2xl border-3 border-curio-green-dark shadow-playful-green transition active:scale-95 cursor-pointer flex items-center gap-1.5 uppercase text-xs"
-                >
-                  <RotateCcw className="w-4 h-4" />
-                  <span>Practice Again</span>
-                </button>
-                <button
-                  onClick={onBack}
-                  className="bg-slate-100 hover:bg-slate-200 border-2 border-curio-slate text-curio-slate font-black py-3 px-6 rounded-2xl transition active:scale-95 cursor-pointer uppercase text-xs shadow"
-                >
-                  Return to Lobby ◀
-                </button>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 max-w-5xl mx-auto px-4 select-none">
+            
+            {/* Left Screen: Floating Canvas */}
+            <div className="lg:col-span-2 bg-white/70 backdrop-blur-md p-4 rounded-4xl border-3 border-white/60 shadow-lg flex flex-col items-center relative min-h-[350px]">
+              
+              {/* Question progress */}
+              <div className="absolute top-4 right-4 bg-slate-100 border border-slate-200 text-slate-500 font-bold px-3 py-1 rounded-full text-[10px] z-50">
+                Card {questionIndex + 1} of 10
               </div>
-            </motion.div>
-          ) : (
-            /* Canvas drawing board viewport */
-            <div 
-              className={`relative w-full aspect-video overflow-hidden rounded-3xl border-6 border-curio-slate bg-black flex items-center justify-center ${
-                sandboxMode ? 'cursor-grab active:cursor-grabbing' : ''
-              }`}
-              onMouseDown={handleSandboxStart}
-              onMouseMove={handleSandboxMove}
-              onMouseUp={handleSandboxEnd}
-              onTouchStart={handleSandboxStart}
-              onTouchMove={handleSandboxMove}
-              onTouchEnd={handleSandboxEnd}
-            >
-              {/* 1. Camera Feeds (Mirrored) */}
-              {!sandboxMode && (
-                <video 
-                  ref={videoRef}
-                  className="absolute inset-0 w-full h-full object-cover transform scale-x-[-1]"
-                  muted
-                  playsInline
-                />
-              )}
 
-              {/* Sandbox Background */}
-              {sandboxMode && (
-                <div className="absolute inset-0 bg-gradient-to-b from-curio-orange-light to-curio-cream select-none pointer-events-none opacity-45" />
-              )}
+              {/* World Theme Container frame (Framer Motion enabled shake anim) */}
+              <motion.div
+                animate={shakeScreen ? { x: [-10, 10, -10, 10, -5, 5, 0] } : { x: 0 }}
+                transition={{ duration: 0.4 }}
+                className={`relative w-full aspect-video overflow-hidden rounded-3xl border-6 bg-gradient-to-b ${activeTheme.style} ${activeTheme.border} flex items-center justify-center transition-all ${
+                  sandboxMode ? 'cursor-grab active:cursor-grabbing' : ''
+                }`}
+                onMouseDown={handleSandboxStart}
+                onMouseMove={handleSandboxMove}
+                onMouseUp={handleSandboxEnd}
+                onTouchStart={handleSandboxStart}
+                onTouchMove={handleSandboxMove}
+                onTouchEnd={handleSandboxEnd}
+              >
+                {/* Red flash mismatch overlay */}
+                {flashRed && (
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: [0.65, 0] }}
+                    className="absolute inset-0 bg-red-600/40 z-45 pointer-events-none"
+                    transition={{ duration: 0.4 }}
+                  />
+                )}
 
-              {/* 2. Skeleton Gesture overlay */}
-              {!sandboxMode && (
-                <canvas 
-                  ref={skeletonCanvasRef}
-                  className="absolute inset-0 w-full h-full pointer-events-none z-10"
+                {/* Mirror camera input stream */}
+                {!sandboxMode && (
+                  <video
+                    ref={videoRef}
+                    className="absolute inset-0 w-full h-full object-cover transform scale-x-[-1]"
+                    muted
+                    playsInline
+                  />
+                )}
+
+                {/* Hand skeleton drawings overlay */}
+                {!sandboxMode && (
+                  <canvas
+                    ref={skeletonCanvasRef}
+                    className="absolute inset-0 w-full h-full pointer-events-none z-10"
+                    width={640}
+                    height={480}
+                  />
+                )}
+
+                {/* Canvas renderer for trails/balloons */}
+                <canvas
+                  ref={gameCanvasRef}
+                  className="absolute inset-0 w-full h-full pointer-events-none z-20"
                   width={640}
                   height={480}
                 />
-              )}
 
-              {/* 3. Letters/Balloons Canvas */}
-              <canvas 
-                ref={gameCanvasRef}
-                className="absolute inset-0 w-full h-full pointer-events-none z-20"
-                width={640}
-                height={480}
-              />
+                {/* Sparkles particle system */}
+                <canvas
+                  ref={sparklesCanvasRef}
+                  className="absolute inset-0 w-full h-full pointer-events-none z-30"
+                  width={640}
+                  height={480}
+                />
 
-              {/* 4. Sparkles particles overlay */}
-              <canvas 
-                ref={sparklesCanvasRef}
-                className="absolute inset-0 w-full h-full pointer-events-none z-30"
-                width={640}
-                height={480}
-              />
-
-              {/* 5. SECURE FALLBACK HTML RENDERING OVERLAY */}
-              <div className="absolute inset-0 z-25 pointer-events-none">
-                <AnimatePresence>
-                  {balloons.map((b) => (
-                    <motion.div
-                      key={b.id}
-                      className={`absolute rounded-full border-4 border-curio-slate flex items-center justify-center font-black select-none pointer-events-auto cursor-grab active:cursor-grabbing shadow-playful ${
-                        wrongShakeId === b.id ? 'animate-wiggle' : ''
+                {/* High-Accuracy Custom Cursor Ring Overlay */}
+                {!sandboxMode && isHandDetected && (
+                  <div 
+                    className="absolute pointer-events-none z-30 transform -translate-x-1/2 -translate-y-1/2"
+                    style={{
+                      left: `${(indexFingerTip.x / 640) * 100}%`,
+                      top: `${(indexFingerTip.y / 480) * 100}%`,
+                    }}
+                  >
+                    {/* Ring indicator */}
+                    <div 
+                      className={`absolute inset-[-15px] rounded-full border-2 ${isPinching ? 'border-curio-pink bg-curio-pink/15 scale-95' : 'border-curio-purple bg-curio-purple/5 scale-100'} transition-all duration-200 ${
+                        balloons.some(b => !b.swallowed && !b.returning && Math.sqrt(Math.pow(indexFingerTip.x - b.x, 2) + Math.pow(indexFingerTip.y - b.y, 2)) < 90)
+                          ? 'animate-pulse border-curio-yellow border-3 scale-110'
+                          : ''
                       }`}
-                      style={{
-                        left: `${(b.x / 640) * 100}%`,
-                        top: `${(b.y / 480) * 100}%`,
-                        transform: 'translate(-50%, -50%)',
-                        width: `${b.radius * 2}px`,
-                        height: `${b.radius * 2}px`,
-                        backgroundColor: b.color,
-                        boxShadow: b.id === grabbedId ? '0 0 20px 8px #FF9F1C' : '0 8px 0px 0px rgba(0,0,0,0.15)',
-                        borderColor: b.id === grabbedId ? '#FFFFFF' : '#1E293B',
-                      }}
-                      animate={{ scale: b.id === grabbedId ? 1.2 : 1.0 }}
-                      onMouseDown={(e) => handleSandboxStart(e)}
-                      onTouchStart={(e) => handleSandboxStart(e)}
-                    >
-                      <span 
-                        className="text-white text-stroke-kids select-none pointer-events-none font-kids"
-                        style={{
-                          fontSize: '48px',
-                          textShadow: '3px 3px 0px #1E293B, -2px -2px 0px #1E293B, 2px -2px 0px #1E293B, -2px 2px 0px #1E293B'
-                        }}
-                      >
-                        {b.label}
-                      </span>
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
-              </div>
+                    />
+                    {/* Center point target */}
+                    <div className={`w-8 h-8 rounded-full ${isPinching ? 'bg-curio-pink scale-95' : 'bg-curio-purple scale-100'} border-3 border-white shadow-lg transition-all duration-200 flex items-center justify-center text-sm`}>
+                      {isPinching ? '✊' : '✋'}
+                    </div>
+                  </div>
+                )}
 
-              {/* Overlaid Drop Zone: styled like a cute mouth monster */}
-              <div 
-                className={`absolute bottom-2 left-1/2 transform -translate-x-1/2 w-48 h-24 rounded-t-5xl border-4 border-b-0 border-curio-slate bg-curio-purple flex flex-col items-center justify-center text-white z-40 transition-all shadow-[0_-8px_0_0_rgba(0,0,0,0.08)] ${
-                  grabbedId !== null ? 'animate-pulse scale-105 border-curio-yellow bg-curio-purple-dark' : ''
-                }`}
-              >
-                <div className="w-16 h-2 bg-pink-300 rounded-full mb-1"></div>
-                <span className="text-[10px] font-black uppercase tracking-wider text-pink-100 select-none pointer-events-none font-kids">Drop here! 😋</span>
-                <span className="text-3xl mt-0.5 select-none pointer-events-none">👾</span>
-              </div>
+                {/* Floating CSS Balloon nodes wrapper */}
+                <div className="absolute inset-0 z-25 pointer-events-none">
+                  <AnimatePresence>
+                    {balloons.map((b) => {
+                      if (b.radius <= 0) return null;
+                      return (
+                        <motion.div
+                          key={b.id}
+                          className={`absolute rounded-full flex items-center justify-center font-black select-none pointer-events-auto cursor-grab active:cursor-grabbing border-3 border-white/90 shadow-lg ${
+                            wrongShakeId === b.id ? 'animate-wiggle' : ''
+                          }`}
+                          style={{
+                            left: `${(b.x / 640) * 100}%`,
+                            top: `${(b.y / 480) * 100}%`,
+                            transform: 'translate(-50%, -50%)',
+                            width: `${b.radius * 2}px`,
+                            height: `${b.radius * 2}px`,
+                            background: `radial-gradient(circle at 30% 30%, #ffffff 0%, ${b.color} 40%, ${b.color} 100%)`,
+                            boxShadow: b.id === grabbedId
+                              ? '0 0 25px 8px rgba(255, 159, 28, 0.65), inset 0 -4px 10px rgba(0,0,0,0.3)'
+                              : '0 8px 16px rgba(0,0,0,0.35), inset 0 -4px 10px rgba(0,0,0,0.25)',
+                          }}
+                          animate={{ scale: b.id === grabbedId ? 1.25 : 1.0 }}
+                          onMouseDown={(e) => handleSandboxStart(e)}
+                          onTouchStart={(e) => handleSandboxStart(e)}
+                        >
+                          {/* 3D Gloss highlight reflection */}
+                          <div className="absolute top-2 left-2 w-3.5 h-2 bg-white/40 rounded-full rotate-[-30deg]"></div>
 
-              {/* Hand Wave guide banner */}
-              {!sandboxMode && !isHandDetected && !isLoadingModels && (
-                <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-white/95 px-4 py-2 rounded-2xl border-2 border-curio-slate text-[10px] font-black text-curio-slate uppercase flex items-center gap-1.5 z-50 animate-bounce shadow select-none pointer-events-none">
-                  <span>Wave your hand at the camera! 👋</span>
+                          {/* Balloon Knot */}
+                          <div 
+                            className="absolute bottom-[-3px] left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-b-[6px]"
+                            style={{ borderBottomColor: b.color }}
+                          ></div>
+
+                          {/* String */}
+                          <div className="absolute bottom-[-22px] left-1/2 transform -translate-x-1/2 w-[2px] h-[20px] bg-white/20 border-l border-dashed border-white/40" />
+
+                          {/* Label Typography */}
+                          <span
+                            className="text-white select-none pointer-events-none font-kids drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]"
+                            style={{
+                              fontSize: `${b.radius * 0.9}px`,
+                              fontWeight: '900',
+                            }}
+                          >
+                            {b.label}
+                          </span>
+                        </motion.div>
+                      );
+                    })}
+                  </AnimatePresence>
                 </div>
-              )}
 
-              {/* Loading Letters / Hand Models Spinner */}
-              {(isLoadingModels || loadingLetters) && (
-                <div className="absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center p-6 text-center space-y-3 z-50 text-white select-none">
-                  <div className="w-10 h-10 border-4 border-slate-700 border-t-curio-orange rounded-full animate-spin" />
-                  <h4 className="font-extrabold text-sm">{loadingLetters ? "Loading letters..." : "Preparing Hand Grabber..."}</h4>
-                  <p className="text-[10px] text-slate-400 font-bold max-w-xs leading-normal">
-                    {loadingLetters ? "Distributing balloons on canvas..." : "MediaPipe Hand tracking weights are loading on-device..."}
-                  </p>
+                {/* Monster Mouth Drop Target (Glows brighter when hovering) */}
+                <div
+                  className={`absolute bottom-2 left-1/2 transform -translate-x-1/2 w-48 h-24 rounded-t-5xl border-4 border-b-0 border-curio-slate bg-curio-purple flex flex-col items-center justify-center text-white z-40 transition-all shadow-[0_-8px_0_0_rgba(0,0,0,0.08)] ${
+                    isHoveringDropZone
+                      ? 'scale-110 border-amber-400 bg-indigo-900 shadow-[0_-8px_35px_10px_rgba(251,191,36,0.6)] font-extrabold animate-pulse'
+                      : grabbedId !== null 
+                        ? 'scale-105 border-curio-yellow bg-curio-purple-dark shadow-[0_-8px_20px_0_rgba(245,158,11,0.3)] shadow-playful' 
+                        : ''
+                  }`}
+                >
+                  <div className="w-16 h-2 bg-pink-300 rounded-full mb-1"></div>
+                  <span className="text-[10px] font-black uppercase tracking-wider text-pink-100 select-none pointer-events-none font-kids">Drop here! 😋</span>
+                  <span className="text-3xl mt-0.5 select-none pointer-events-none">👾</span>
                 </div>
-              )}
-            </div>
-          )}
 
-          {/* Sandbox Toggle */}
-          {!sessionCompleted && (
-            <div className="w-full flex justify-between items-center mt-4 select-none">
-              <button
-                onClick={() => {
-                  const nextMode = !sandboxMode;
-                  setSandboxMode(nextMode);
-                  setGrabbedId(null);
-                  if (nextMode) {
-                    stopTracking();
-                  }
-                }}
-                className="text-xs font-black text-curio-purple hover:underline bg-slate-100/60 hover:bg-slate-200 border-2 border-curio-slate px-3 py-2 rounded-xl flex items-center gap-1 shadow cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>{sandboxMode ? "Use Active Hand Camera" : "Switch to Button Sandbox"}</span>
-              </button>
+                {/* Hand tracker loader feedback */}
+                {!sandboxMode && isLoadingModels && (
+                  <div className="absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center p-6 text-center space-y-3 z-50 text-white select-none">
+                    <div className="w-10 h-10 border-4 border-slate-700 border-t-curio-orange rounded-full animate-spin" />
+                    <h4 className="font-extrabold text-sm">Preparing Hand Grabber...</h4>
+                    <p className="text-[10px] text-slate-400 font-bold max-w-xs leading-normal">
+                      Camera tracking assets are booting up. Wave hand when ready!
+                    </p>
+                  </div>
+                )}
 
-              <div className="flex gap-2 items-center text-xs font-black text-slate-400 uppercase">
-                <Flame className="w-4 h-4 text-curio-pink fill-curio-pink" />
-                <span>Streak: {streak}</span>
+                {/* Letter Loader fallback */}
+                {loadingLetters && (
+                  <div className="absolute inset-0 bg-slate-950/40 z-50 flex items-center justify-center">
+                    <div className="w-8 h-8 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+                  </div>
+                )}
+              </motion.div>
+
+              <div className="w-full flex justify-between items-center mt-4 select-none">
+                <button
+                  onClick={() => {
+                    const nextMode = !sandboxMode;
+                    setSandboxMode(nextMode);
+                    setGrabbedId(null);
+                    if (nextMode) {
+                      stopTracking();
+                    }
+                  }}
+                  className="text-xs font-black text-curio-purple hover:underline bg-slate-100/60 hover:bg-slate-200 border-2 border-curio-slate px-3 py-2 rounded-xl flex items-center gap-1 shadow cursor-pointer transition"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>{sandboxMode ? "Use Active Hand Camera" : "Switch to Button Sandbox"}</span>
+                </button>
+
+                <div className="flex gap-2 items-center text-xs font-black text-slate-400 uppercase">
+                  <Flame className="w-4 h-4 text-curio-pink fill-curio-pink" />
+                  <span>Streak: {streak}</span>
+                </div>
               </div>
             </div>
-          )}
 
-        </div>
+            {/* Right Pane question metrics */}
+            <div className="space-y-6 select-none">
+              {/* Question card */}
+              <div className="bg-white/70 backdrop-blur-md p-6 rounded-4xl border-3 border-white/60 shadow-lg text-center space-y-4">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none">
+                  Active Challenge
+                </h4>
+                
+                <div className="bg-slate-50 py-4 px-6 rounded-3xl border-2 border-slate-100 min-h-[100px] flex flex-col justify-center shadow-inner">
+                  <h5 className="text-lg font-black text-curio-slate leading-snug">
+                    {currentQuestion.prompt}
+                  </h5>
+                  <span className="text-[10px] font-black text-curio-purple uppercase tracking-wider mt-2.5 block leading-none">
+                    World: {activeTheme.name}
+                  </span>
+                </div>
 
-        {/* Right Stats Sidebar */}
-        <div className="space-y-6 select-none">
-          
-          {/* Question Prompt Card */}
-          <div className="bg-white/70 backdrop-blur-md p-6 rounded-4xl border-3 border-white/60 shadow-lg text-center space-y-4">
-            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">Question {questionIndex + 1} / 10</h4>
-            
-            <div className="bg-slate-50 py-4 px-6 rounded-3xl border-2 border-slate-100 min-h-[100px] flex flex-col justify-center shadow-inner">
-              <h5 className="text-lg font-black text-curio-slate leading-snug">
-                {currentQuestion.prompt}
-              </h5>
-              <span className="text-[10px] font-black text-curio-purple uppercase tracking-wider mt-2 block">
-                Difficulty: {currentQuestion.difficulty === 1 ? '🟢 Easy' : (currentQuestion.difficulty === 2 ? '🟡 Medium' : '🔴 Hard')}
-              </span>
-            </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3 bg-curio-orange-light/50 border-2 border-slate-100 rounded-2xl">
+                    <span className="text-[9px] font-black text-slate-400 uppercase block leading-none">Attempts</span>
+                    <span className="text-xl font-black text-curio-orange mt-1 block leading-none">{attempts} / 3</span>
+                  </div>
+                  <div className="p-3 bg-sky-100/50 border-2 border-slate-100 rounded-2xl">
+                    <span className="text-[9px] font-black text-slate-400 uppercase block leading-none">Drift Speed</span>
+                    <span className="text-xl font-black text-sky-600 mt-1 block leading-none capitalize">{config.speed}</span>
+                  </div>
+                </div>
+              </div>
 
-            <div className="p-3 bg-curio-orange-light/50 border-2 border-slate-100 rounded-2xl">
-              <span className="text-[9px] font-black text-slate-400 uppercase block">Attempt Record</span>
-              <span className="text-2xl font-black text-curio-orange mt-1 block">{attempts} / 3</span>
+              {/* Guidelines panel */}
+              <div className="bg-white/70 backdrop-blur-md p-5 rounded-4xl border-3 border-white/60 shadow-lg space-y-3">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                  🎮 Grab Room Rules
+                </h4>
+                
+                <ul className="text-[10px] text-slate-500 font-bold space-y-2 leading-relaxed list-disc list-inside">
+                  <li>Pinch thumb and index finger to grab a floating balloon letter!</li>
+                  <li>Drift it over the bottom Monster Mouth and release to drop!</li>
+                  <li>Wrong drops trigger shake effects and flashing screen alerts.</li>
+                </ul>
+              </div>
             </div>
           </div>
+        </>
+      )}
 
-          {/* Guide notes */}
-          <div className="bg-white/70 backdrop-blur-md p-5 rounded-4xl border-3 border-white/60 shadow-lg space-y-3">
-            <h4 className="text-xs font-black text-slate-400 uppercase tracking-wider">
-              🎮 Balloon Room Rules
-            </h4>
-            <ul className="text-[10px] text-slate-500 font-bold space-y-2 leading-relaxed list-disc list-inside">
-              <li>Pinch thumb and index finger to grab a floating balloon letter!</li>
-              <li>Drift it over the bottom Monster Mouth and release to drop!</li>
-              <li>Bouncy physics bounce balloons off edge walls.</li>
-            </ul>
-          </div>
-        </div>
-
-      </div>
-
+      {gamePhase === 'complete' && (
+        <GameComplete
+          gameName="alphabetGrab"
+          level={currentLevel}
+          starsEarned={earnedStars}
+          points={calculatedPoints}
+          stats={{
+            timeTaken,
+            accuracy: stats.questionsAttempted > 0 ? Math.round((stats.questionsCorrect / stats.questionsAttempted) * 100) : 100,
+            combo: bestStreak
+          }}
+          onReplay={() => startNewGame(currentLevel)}
+          onNextLevel={handleNextLevel}
+          onHome={() => setGamePhase('menu')}
+        />
+      )}
     </div>
   );
 }

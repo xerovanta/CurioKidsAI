@@ -52,6 +52,13 @@ export default function AIBuddy({
     };
   }, [isListeningActive, onSpeechRecognized, startListening, stopListening]);
 
+  // Cancel speech on unmount (sudden game exit)
+  useEffect(() => {
+    return () => {
+      cancelAllSpeech();
+    };
+  }, [cancelAllSpeech]);
+
   return (
     <div className="flex flex-col sm:flex-row items-center gap-6 p-4 max-w-2xl mx-auto select-none">
       
